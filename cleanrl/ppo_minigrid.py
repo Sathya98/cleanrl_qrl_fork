@@ -1,63 +1,67 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_procgenpy
+# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_ataripy
 import os
 import random
 import time
 from dataclasses import dataclass
 
-import gym
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import tyro
-from procgen import ProcgenEnv
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
+from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
+
+from cleanrl_utils.minigrid_wrappers import TransposeImage
 
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-    seed: int = 1
+    seed: int = 0
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = False
+    cuda_device: int = 4
+    """the device to use for training"""
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanRL"
+    wandb_project_name: str = "quantum_rl"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: str = "sathyafrml"
     """the entity (team) of wandb's project"""
-    capture_video: bool = False
+    capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "starpilot"
+    env_id: str = "MiniGrid-MemoryS7-v0"
     """the id of the environment"""
-    total_timesteps: int = int(25e6)
+    total_timesteps: int = 15000000
     """total timesteps of the experiments"""
-    learning_rate: float = 5e-4
+    learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 64
+    num_envs: int = 16
     """the number of parallel game environments"""
-    num_steps: int = 256
+    num_steps: int = 512
     """the number of steps to run in each environment per policy rollout"""
-    anneal_lr: bool = False
+    anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
-    gamma: float = 0.999
+    gamma: float = 0.995
     """the discount factor gamma"""
     gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
     num_minibatches: int = 8
     """the number of mini-batches"""
-    update_epochs: int = 3
+    update_epochs: int = 4
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
-    clip_coef: float = 0.2
+    clip_coef: float = 0.1
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
@@ -78,6 +82,29 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
 
+def make_env(env_id, idx, capture_video, video_folder_path,
+            record_every=100, agent_view_size=3, tile_size=28,
+            max_episode_steps=96, frame_stack=4
+        ):
+    def thunk():
+        env = gym.make(
+            env_id,
+            agent_view_size=agent_view_size,
+            tile_size=tile_size,
+            render_mode="rgb_array" if capture_video else None,
+        )
+        env = ImgObsWrapper(RGBImgPartialObsWrapper(env, tile_size=tile_size))
+        env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
+        if capture_video and idx == 0:
+            env = gym.wrappers.RecordVideo(env, video_folder_path,
+                                           episode_trigger=lambda episode_id: (episode_id + 1) % record_every == 0
+                                           )
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        if frame_stack > 1:
+            env = gym.wrappers.FrameStack(env, frame_stack)
+        return env
+    return thunk
+
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -85,69 +112,31 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-# taken from https://github.com/AIcrowd/neurips2020-procgen-starter-kit/blob/142d09586d2272a17f44481a115c4bd817cf6a94/models/impala_cnn_torch.py
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.conv0 = nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1)
-        self.conv1 = nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1)
-
-    def forward(self, x):
-        inputs = x
-        x = nn.functional.relu(x)
-        x = self.conv0(x)
-        x = nn.functional.relu(x)
-        x = self.conv1(x)
-        return x + inputs
-
-
-class ConvSequence(nn.Module):
-    def __init__(self, input_shape, out_channels):
-        super().__init__()
-        self._input_shape = input_shape
-        self._out_channels = out_channels
-        self.conv = nn.Conv2d(in_channels=self._input_shape[0], out_channels=self._out_channels, kernel_size=3, padding=1)
-        self.res_block0 = ResidualBlock(self._out_channels)
-        self.res_block1 = ResidualBlock(self._out_channels)
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = nn.functional.max_pool2d(x, kernel_size=3, stride=2, padding=1)
-        x = self.res_block0(x)
-        x = self.res_block1(x)
-        assert x.shape[1:] == self.get_output_shape()
-        return x
-
-    def get_output_shape(self):
-        _c, h, w = self._input_shape
-        return (self._out_channels, (h + 1) // 2, (w + 1) // 2)
-
-
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, action_space):
         super().__init__()
-        h, w, c = envs.single_observation_space.shape
-        shape = (c, h, w)
-        conv_seqs = []
-        for out_channels in [16, 32, 32]:
-            conv_seq = ConvSequence(shape, out_channels)
-            shape = conv_seq.get_output_shape()
-            conv_seqs.append(conv_seq)
-        conv_seqs += [
+        # Get input channels from observation space: should be 3 * frame_stack for RGB
+        self.network = nn.Sequential(
+            layer_init(nn.Conv2d(12, 32, 8, stride=4)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+            nn.ReLU(),
             nn.Flatten(),
+            layer_init(nn.Linear(64 * 7 * 7, 512)),
             nn.ReLU(),
-            nn.Linear(in_features=shape[0] * shape[1] * shape[2], out_features=256),
-            nn.ReLU(),
-        ]
-        self.network = nn.Sequential(*conv_seqs)
-        self.actor = layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
-        self.critic = layer_init(nn.Linear(256, 1), std=1)
+        )
+        self.actor = layer_init(nn.Linear(512, action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(512, 1), std=1)
 
     def get_value(self, x):
-        return self.critic(self.network(x.permute((0, 3, 1, 2)) / 255.0))  # "bhwc" -> "bchw"
+        x = x.permute(0, 4, 1, 2, 3).reshape(x.shape[0], 12, 84, 84) / 255.0
+        return self.critic(self.network(x))
 
     def get_action_and_value(self, x, action=None):
-        hidden = self.network(x.permute((0, 3, 1, 2)) / 255.0)  # "bhwc" -> "bchw"
+        x = x.permute(0, 4, 1, 2, 3).reshape(x.shape[0], 12, 84, 84) / 255.0
+        hidden = self.network(x)
         logits = self.actor(hidden)
         probs = Categorical(logits=logits)
         if action is None:
@@ -160,7 +149,12 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"cleanrl_ppo_minigrid_{args.env_id}_{args.seed}_{int(time.time())}"
+    run_dir = f"./runs/cleanrl_ppo_minigrid_{args.env_id}/s{args.seed}"
+    os.makedirs(run_dir, exist_ok=True)
+    video_folder_path = f"{run_dir}/videos"
+    os.makedirs(video_folder_path, exist_ok=True)
+
     if args.track:
         import wandb
 
@@ -173,7 +167,7 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
+    writer = SummaryWriter(run_dir)
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -185,22 +179,16 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    device = torch.device(f"cuda:{args.cuda_device}" if torch.cuda.is_available() and args.cuda else "cpu")
+    print(f"Using device: {device}")
 
     # env setup
-    envs = ProcgenEnv(num_envs=args.num_envs, env_name=args.env_id, num_levels=0, start_level=0, distribution_mode="easy")
-    envs = gym.wrappers.TransformObservation(envs, lambda obs: obs["rgb"])
-    envs.single_action_space = envs.action_space
-    envs.single_observation_space = envs.observation_space["rgb"]
-    envs.is_vector_env = True
-    envs = gym.wrappers.RecordEpisodeStatistics(envs)
-    if args.capture_video:
-        envs = gym.wrappers.RecordVideo(envs, f"videos/{run_name}")
-    envs = gym.wrappers.NormalizeReward(envs, gamma=args.gamma)
-    envs = gym.wrappers.TransformReward(envs, lambda reward: np.clip(reward, -10, 10))
+    envs = gym.vector.SyncVectorEnv(
+        [make_env(args.env_id, i, args.capture_video, video_folder_path) for i in range(args.num_envs)],
+    )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
-
-    agent = Agent(envs).to(device)
+    
+    agent = Agent(envs.single_action_space).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
@@ -214,7 +202,8 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    next_obs = torch.Tensor(envs.reset()).to(device)
+    next_obs, _ = envs.reset(seed=args.seed)
+    next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
     for iteration in range(1, args.num_iterations + 1):
@@ -237,16 +226,17 @@ if __name__ == "__main__":
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, next_done, info = envs.step(action.cpu().numpy())
+            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            next_done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
-            for item in info:
-                if "episode" in item.keys():
-                    print(f"global_step={global_step}, episodic_return={item['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", item["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", item["episode"]["l"], global_step)
-                    break
+            if "final_info" in infos:
+                for info in infos["final_info"]:
+                    if info and "episode" in info:
+                        # print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
+                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
         # bootstrap value if not done
         with torch.no_grad():
