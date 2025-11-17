@@ -41,9 +41,11 @@ class Args:
     """the id of the environment"""
     total_timesteps: int = 15000000
     """total timesteps of the experiments"""
-    learning_rate: float = 2.5e-4
+    learning_rate: float = 2.75e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 16
+    min_learning_rate: float = 0.0
+    """the minimum learning rate (used when annealing)"""
+    num_envs: int = 32
     """the number of parallel game environments"""
     num_steps: int = 512
     """the number of steps to run in each environment per policy rollout"""
@@ -55,7 +57,7 @@ class Args:
     """the lambda for the general advantage estimation"""
     num_minibatches: int = 8
     """the number of mini-batches"""
-    update_epochs: int = 4
+    update_epochs: int = 3
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
@@ -63,11 +65,11 @@ class Args:
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.01
+    ent_coef: float = 0.0001
     """coefficient of the entropy"""
     vf_coef: float = 0.5
     """coefficient of the value function"""
-    max_grad_norm: float = 0.5
+    max_grad_norm: float = 0.25
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""
@@ -203,7 +205,7 @@ if __name__ == "__main__":
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lrnow = frac * args.learning_rate
+            lrnow = args.min_learning_rate + frac * (args.learning_rate - args.min_learning_rate)
             optimizer.param_groups[0]["lr"] = lrnow
 
         for step in range(0, args.num_steps):
