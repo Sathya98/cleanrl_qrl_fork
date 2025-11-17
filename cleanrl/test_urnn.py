@@ -1,13 +1,13 @@
 import torch
 import numpy as np
-from cleanrl.urnn import URNN, LegacyURNN, householder_matrix
+from urnn import URNN, LegacyURNN, householder_matrix
 
 # Test parameters
-input_dim = 64
-hidden_dim = 128
+input_dim = 32
+hidden_dim = 32
 sequence_length = 16
 batch_size = 4
-
+torch.manual_seed(42)
 
 def test_householder_matrix():
     """Test that householder_matrix produces unitary matrices."""
@@ -17,19 +17,17 @@ def test_householder_matrix():
     
     hidden_size = hidden_dim
     # Create a random complex vector and normalize it
-    v_real = torch.randn(hidden_size)
-    v_imag = torch.randn(hidden_size)
-    v = torch.complex(v_real, v_imag)
-    v = v / (torch.abs(v).sum() + 1e-8)  # Normalize
+    v = torch.randn((1, hidden_size), dtype=torch.complex64)
+    v = v / torch.linalg.norm(v)  # Normalize
     
     # Build Householder matrix
-    H = householder_matrix(v)  # (hidden_size, hidden_size)
+    H = householder_matrix(v)  # (1, hidden_size, hidden_size)
     
     # Verify unitarity: H @ H.conj().T should be close to I
-    I_expected = torch.eye(hidden_size, dtype=torch.complex64)
-    H_H_dag = H @ H.conj().T
+    I_expected = torch.eye(hidden_size, dtype=torch.complex64).unsqueeze(0)  # (1, hidden_size, hidden_size)
+    H_H_dag = torch.bmm(H, H.conj().transpose(-2, -1))  # (1, hidden_size, hidden_size)
     
-    error = torch.abs(H_H_dag - I_expected).max().item()
+    error = torch.abs(H_H_dag - I_expected).max().item()  # scalar
     print(f"Householder matrix shape: {H.shape}")
     print(f"Max error from identity (|H @ H^dagger - I|): {error:.2e}")
     
@@ -40,7 +38,7 @@ def test_householder_matrix():
     
     # Also check determinant (should be -1 for reflection)
     det = torch.linalg.det(H)
-    print(f"Determinant: {det:.6f} (expected: -1.0 for reflection)")
+    print(f"Determinant: {det.item()} (expected: -1.0 for reflection)")
     
     print()
 
@@ -76,7 +74,7 @@ def test_urnn():
         outputs.append(output)
         
         # Track norms
-        norm = torch.abs(output).mean().item()
+        norm = torch.linalg.norm(output).item()
         norms.append(norm)
         
         if t < 3 or t >= sequence_length - 3:
