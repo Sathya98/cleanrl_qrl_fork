@@ -1,4 +1,4 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_ataripy
+# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_atari_urnnpy
 import os
 import random
 import time
@@ -12,20 +12,21 @@ import torch.optim as optim
 import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
-
 import memory_gym
+from cleanrl.urnn import URNN, LegacyURNN
+
 
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-    seed: int = 6
+    seed: int = 3
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    cuda_device: int = 6
+    cuda_device: int = 0
     """the device to use for training"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
@@ -44,7 +45,15 @@ class Args:
     learning_rate: float = 2.75e-4
     """the learning rate of the optimizer"""
     min_learning_rate: float = 1e-5
-    """the minimum learning rate (used when annealing)"""
+    """the minimum learning rate of the optimizer"""
+    complex_learning_rate: float = 8e-5
+    """the learning rate of the complex parameters"""
+    legacy_urnn: bool = False
+    """whether to use the legacy URNN"""
+    urnn_input_dense: bool = True
+    """whether to add input embed to hidden state URNN"""
+    urnn_units: int = 128
+    """the hidden size of the URNN"""
     num_envs: int = 32
     """the number of parallel game environments"""
     num_steps: int = 512
@@ -82,8 +91,9 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
 
+
 def make_env(env_id, idx, capture_video, video_folder_path,
-            record_every=1000, frame_stack=4
+            record_every=1000, frame_stack=1
         ):
     def thunk():
         env = gym.make(
@@ -95,10 +105,8 @@ def make_env(env_id, idx, capture_video, video_folder_path,
                                            episode_trigger=lambda episode_id: (episode_id + 1) % record_every == 0
                                            )
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        print(f"Observation space: {env.observation_space}")
         if frame_stack > 1:
             env = gym.wrappers.FrameStack(env, frame_stack)
-        print(f"Observation space after frame stack: {env.observation_space}")
         return env
     return thunk
 
@@ -110,11 +118,10 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, action_space):
+    def __init__(self, envs, urnn_units=128, legacy_urnn=False, urnn_id=False):
         super().__init__()
-        # Get input channels from observation space: should be 3 * frame_stack for RGB
         self.network = nn.Sequential(
-            layer_init(nn.Conv2d(12, 32, 8, stride=4)),
+            layer_init(nn.Conv2d(3, 32, 8, stride=4)),
             nn.ReLU(),
             layer_init(nn.Conv2d(32, 64, 4, stride=2)),
             nn.ReLU(),
@@ -124,21 +131,50 @@ class Agent(nn.Module):
             layer_init(nn.Linear(64 * 7 * 7, 512)),
             nn.ReLU(),
         )
-        self.actor = layer_init(nn.Linear(512, action_space.n), std=0.01)
-        self.critic = layer_init(nn.Linear(512, 1), std=1)
+        if legacy_urnn:
+            self.urnn = LegacyURNN(512, urnn_units, norm_scale=np.sqrt(urnn_units))
+        else:
+            self.urnn = URNN(512, urnn_units, add_input_dense=urnn_id, norm_scale=np.sqrt(urnn_units))
+        # Actor and critic take concatenated real/imaginary parts (2 * hidden_size = 256)
+        self.actor = layer_init(nn.Linear(2 * urnn_units, envs.single_action_space.n), std=0.01)
+        self.critic = layer_init(nn.Linear(2 * urnn_units, 1), std=1)
 
-    def get_value(self, x):
-        x = x.permute(0, 4, 1, 2, 3).reshape(x.shape[0], 12, 84, 84) / 255.0
-        return self.critic(self.network(x))
+    def get_states(self, x, urnn_state, done):
+        hidden = self.network(x.permute(0, 3, 1, 2) / 255.0)
 
-    def get_action_and_value(self, x, action=None):
-        x = x.permute(0, 4, 1, 2, 3).reshape(x.shape[0], 12, 84, 84) / 255.0
-        hidden = self.network(x)
-        logits = self.actor(hidden)
+        # URNN logic
+        batch_size = urnn_state.shape[0]
+        hidden = hidden.reshape((-1, batch_size, self.urnn.input_size))
+        done = done.reshape((-1, batch_size))
+        new_hidden = []
+        for h, d in zip(hidden, done):
+            # Reset state where done is True
+            reset_mask = (1.0 - d).view(batch_size, 1)  # (batch_size, 1)
+            urnn_state = reset_mask * urnn_state + (1 - reset_mask) * self.urnn.initial_hidden(batch_size)
+            
+            # Process through URNN
+            h_complex, urnn_state = self.urnn(h, urnn_state)
+            new_hidden += [h_complex]
+        
+        new_hidden = torch.cat(new_hidden, dim=0)  # (seq_len * batch_size, hidden_size) complex
+        
+        return new_hidden, urnn_state
+
+    def get_value(self, x, urnn_state, done):
+        hidden_complex, _ = self.get_states(x, urnn_state, done)
+        # Convert complex to real only when needed for critic
+        hidden_real = torch.cat([hidden_complex.real, hidden_complex.imag], dim=-1)
+        return self.critic(hidden_real)
+
+    def get_action_and_value(self, x, urnn_state, done, action=None):
+        hidden_complex, urnn_state = self.get_states(x, urnn_state, done)
+        # Convert complex to real only when needed for actor/critic
+        hidden_real = torch.cat([hidden_complex.real, hidden_complex.imag], dim=-1)
+        logits = self.actor(hidden_real)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden)
+        return action, probs.log_prob(action), probs.entropy(), self.critic(hidden_real), urnn_state
 
 
 if __name__ == "__main__":
@@ -146,8 +182,12 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"cleanrl_ppo_memory_gym_{args.env_id}_{args.seed}_{int(time.time())}"
-    run_dir = f"./runs/cleanrl_ppo_memory_gym_{args.env_id}/s{args.seed}"
+
+    #naming section
+    id = "id_" if args.urnn_input_dense else ""
+    legacy = "leg" if args.legacy_urnn else ""
+    run_name = f"cleanrl_ppo_memory_gym_{legacy}urnn{args.urnn_units}_{id}{args.env_id}_{args.seed}_{int(time.time())}"
+    run_dir = f"./runs/cleanrl_ppo_memory_gym_{legacy}urnn{args.urnn_units}_{id}{ args.env_id}/s{args.seed}"
     os.makedirs(run_dir, exist_ok=True)
     video_folder_path = f"{run_dir}/videos"
     os.makedirs(video_folder_path, exist_ok=True)
@@ -184,9 +224,21 @@ if __name__ == "__main__":
         [make_env(args.env_id, i, args.capture_video, video_folder_path) for i in range(args.num_envs)],
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
-    
-    agent = Agent(envs.single_action_space).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+
+    agent = Agent(envs, args.urnn_units, args.legacy_urnn, args.urnn_input_dense).to(device)
+    agent = torch.compile(
+        agent,
+        mode="max-autotune",
+        dynamic=True,  # CRITICAL: handles batch size 2 vs 8 without recompilation
+        fullgraph=False,  # Allow graph breaks for FFT/complex ops
+    )
+    optimizer = optim.Adam([
+        {'params': agent.network.parameters()},
+        {'params': agent.actor.parameters()},
+        {'params': agent.critic.parameters()}, 
+        {'params': agent.urnn.parameters(), 'lr': args.complex_learning_rate},
+    ], lr=args.learning_rate, eps=1e-5)
+    print([group['lr'] for group in optimizer.param_groups])
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -202,14 +254,18 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
+    next_urnn_state = agent.urnn.initial_hidden(args.num_envs)  # (batch_size, hidden_size) complex
 
     for iteration in range(1, args.num_iterations + 1):
+        initial_urnn_state = next_urnn_state.clone()
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lrnow = args.min_learning_rate + frac * (args.learning_rate - args.min_learning_rate)
-            optimizer.param_groups[0]["lr"] = lrnow
-
+            for group in optimizer.param_groups[:-1]:
+                group['lr'] = args.min_learning_rate + frac * (args.learning_rate - args.min_learning_rate)
+            optimizer.param_groups[-1]['lr'] = args.min_learning_rate + \
+                frac * (args.complex_learning_rate - args.min_learning_rate)
+        
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
@@ -217,7 +273,7 @@ if __name__ == "__main__":
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, logprob, _, value, next_urnn_state = agent.get_action_and_value(next_obs, next_urnn_state, next_done)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
@@ -231,13 +287,17 @@ if __name__ == "__main__":
             if "final_info" in infos:
                 for info in infos["final_info"]:
                     if info and "episode" in info:
-                        # print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            next_value = agent.get_value(
+                next_obs,
+                next_urnn_state,
+                next_done,
+            ).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -255,20 +315,30 @@ if __name__ == "__main__":
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_dones = dones.reshape(-1)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
 
         # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
+        assert args.num_envs % args.num_minibatches == 0
+        envsperbatch = args.num_envs // args.num_minibatches
+        envinds = np.arange(args.num_envs)
+        flatinds = np.arange(args.batch_size).reshape(args.num_steps, args.num_envs)
         clipfracs = []
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
+            np.random.shuffle(envinds)
+            for start in range(0, args.num_envs, envsperbatch):
+                end = start + envsperbatch
+                mbenvinds = envinds[start:end]
+                mb_inds = flatinds[:, mbenvinds].ravel()  # be really careful about the index
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                _, newlogprob, entropy, newvalue, _ = agent.get_action_and_value(
+                    b_obs[mb_inds],
+                    initial_urnn_state[mbenvinds],
+                    b_dones[mb_inds],
+                    b_actions.long()[mb_inds],
+                )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -331,3 +401,4 @@ if __name__ == "__main__":
 
     envs.close()
     writer.close()
+
