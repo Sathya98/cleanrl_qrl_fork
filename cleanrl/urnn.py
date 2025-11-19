@@ -18,7 +18,10 @@ def householder_matrix(v: torch.Tensor) -> torch.Tensor:
     v = v.unsqueeze(-1)  # (..., hidden_size, 1)
     v_dag = v.conj().transpose(-2, -1)  # (..., 1, hidden_size)
 
-    I = torch.tile(torch.eye(v.shape[-2], dtype=v.dtype, device=v.device), (v.shape[0], 1, 1))
+    if len(v.shape) == 2:
+        I = torch.eye(v.shape[-2], dtype=v.dtype, device=v.device)
+    else:
+        I = torch.tile(torch.eye(v.shape[-2], dtype=v.dtype, device=v.device), (v.shape[0], 1, 1))
     
     return I - 2 * (v @ v_dag)
 
@@ -33,7 +36,7 @@ def complex_unit_norm(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     Returns:
         Normalized complex tensor with same shape
     """
-    norm = torch.norm(x, dim=-1, keepdim=True)
+    norm = torch.linalg.norm(x, dim=-1, keepdim=True)
     return x / (norm + eps)
 
 
@@ -99,19 +102,20 @@ class URNN(nn.Module):
         input_size: int,
         hidden_size: int,
         add_input_dense: bool = False,
-        eps: float = 1e-8,
+        norm_scale: float = 1.0,
     ):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.add_input_dense = add_input_dense
-        self.eps = eps
+        self.norm_scale = norm_scale
         
-        self.unitary_embed = nn.Linear(input_size, hidden_size * 5)
+        self.diag_embed = nn.Linear(input_size, hidden_size * 3)
+        self.rot_embed = nn.Linear(input_size, hidden_size * 2, dtype=torch.complex64)
         
         # Optional input feed (dense connection)
         if add_input_dense:
-            self.input_embed = nn.Linear(input_size, hidden_size, dtype=torch.complex64)
+            self.input_embed = nn.Linear(input_size, hidden_size, bias=False, dtype=torch.complex64)
         else:
             self.input_embed = None
         
@@ -125,18 +129,16 @@ class URNN(nn.Module):
     
     def reset_parameters(self):
         """Initialize parameters with orthogonal initialization."""
-        nn.init.orthogonal_(self.unitary_embed.weight, gain=1.0)
+        nn.init.orthogonal_(self.diag_embed.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.rot_embed.weight)
         if self.input_embed is not None:
-            nn.init.orthogonal_(self.input_embed.weight, gain=1.0)
+            nn.init.xavier_uniform_(self.input_embed.weight)
     
     def initial_hidden(self, batch_size: int = 1) -> torch.Tensor:
-        """
-        Initialize hidden state to equal superposition.
-        Returns:
-            h: (batch_size, hidden_size) complex tensor
-        """
-        h = torch.ones(batch_size, self.hidden_size, dtype=torch.complex64) / np.sqrt(self.hidden_size)
-        return h
+        """Initialize hidden state to equal superposition."""
+        device = next(self.parameters()).device
+        h = np.sqrt(self.norm_scale / (2 * self.hidden_size)) + 1j * np.sqrt(self.norm_scale / (2 * self.hidden_size))
+        return h * torch.ones(batch_size, self.hidden_size, dtype=torch.complex64, device=device)
     
     def forward(
         self,
@@ -153,21 +155,22 @@ class URNN(nn.Module):
             output: (batch, hidden_size) complex tensor
             h_new: (batch, hidden_size) complex tensor (same as output)
         """
-        unitary_params = self.unitary_embed(input)  # (batch, hidden_size * 5)
-        d1, d2, d3, r1, r2 = torch.chunk(torch.exp(1j * unitary_params), 5, dim=-1)  # (batch, hidden_size) complex
-        R1 = householder_matrix(r1)  # (batch, hidden_size, hidden_size)
-        R2 = householder_matrix(r2)  # (batch, hidden_size, hidden_size)
+        diag_params = self.diag_embed(input)
+        rot_params = self.rot_embed(input.to(torch.complex64))
+        d1, d2, d3 = torch.chunk(torch.exp(1j * diag_params), 3, dim=-1)  # (batch, hidden_size) complex
+        r1, r2 = torch.chunk(rot_params, 2, dim=-1)  # (batch, hidden_size) complex
+        R1 = householder_matrix(complex_unit_norm(r1))
+        R2 = householder_matrix(complex_unit_norm(r2))
         
         h = torch.fft.fft(d1 * hx, dim=-1)  # (batch, hidden_size)
-        h = torch.bmm(R1, h.unsqueeze(-1)).squeeze(-1)  # (batch, hidden_size)
-        h = torch.fft.ifft(d2 * h[:, self.permutation], dim=-1)  # (batch, hidden_size)
-        h = d3 * torch.bmm(R2, h.unsqueeze(-1)).squeeze(-1)  # (batch, hidden_size)
+        h = torch.bmm(R1, h.unsqueeze(-1)).squeeze(-1)
+        h = torch.fft.ifft(d2 * h[:, self.permutation], dim=-1)
+        h = d3 * torch.bmm(R2, h.unsqueeze(-1)).squeeze(-1)
         
         # Optional input feed
         if self.add_input_dense and self.input_embed is not None:
-            h = h + self.input_embed(input)
-        
-        h = self.activation(h)  # (batch, hidden_size)
+            h = h + self.input_embed(input.to(torch.complex64))
+        h = self.activation(h)
         
         return h, h
 
@@ -202,12 +205,10 @@ class LegacyURNN(nn.Module):
         self.diag = nn.Parameter(torch.exp(1j * diag_init))
         
         # Learnable rotation vectors (complex parameters)
-        rot_init_real = torch.randn(hidden_size * 2)
-        rot_init_imag = torch.randn(hidden_size * 2)
-        self.rotation = nn.Parameter(torch.complex(rot_init_real, rot_init_imag))
+        self.rotation = nn.Parameter(torch.rand(hidden_size * 2, dtype=torch.complex64) * 2 - (1 + 1j))
         
         # Input embedding: real input -> complex hidden_size
-        self.input_embed = nn.Linear(input_size, hidden_size, bias=False)
+        self.input_embed = nn.Linear(input_size, hidden_size, bias=False, dtype=torch.complex64)
         
         # Fixed permutation matrix
         perm = torch.randperm(hidden_size)
@@ -220,21 +221,13 @@ class LegacyURNN(nn.Module):
     
     def reset_parameters(self):
         """Initialize parameters."""
-        with torch.no_grad():
-            self.rotation.data = complex_unit_norm(self.rotation.data, self.eps)
         nn.init.xavier_uniform_(self.input_embed.weight)
     
-    def initial_hidden(self, batch_size: int = 1, device=None, dtype=None) -> torch.Tensor:
+    def initial_hidden(self, batch_size: int = 1) -> torch.Tensor:
         """Initialize hidden state to equal superposition."""
-        if dtype is None:
-            dtype = torch.complex64
-        h_val = np.sqrt(self.norm_scale / (2 * self.hidden_size))
-        h = torch.full(
-            (batch_size, self.hidden_size),
-            h_val + 1j * h_val,
-            dtype=dtype, device=device
-        )
-        return h
+        device = next(self.parameters()).device
+        h = np.sqrt(self.norm_scale / (2 * self.hidden_size)) + 1j * np.sqrt(self.norm_scale / (2 * self.hidden_size))
+        return h * torch.ones(batch_size, self.hidden_size, dtype=torch.complex64, device=device)
     
     def forward(
         self,
@@ -252,22 +245,19 @@ class LegacyURNN(nn.Module):
             h_new: (batch, hidden_size) complex tensor (same as output)
         """
         # Split and normalize learnable parameters
-        d1, d2, d3 = torch.chunk(self.diag / (torch.abs(self.diag) + self.eps), 3, dim=0)
-        r1, r2 = torch.chunk(complex_unit_norm(self.rotation, self.eps), 2, dim=0)
-        
+        d1, d2, d3 = torch.chunk(self.diag, 3, dim=0)
+        r1, r2 = torch.chunk(self.rotation, 2, dim=0)
         # Build Householder matrices (same for all batch elements)
-        R1 = householder_matrix(r1)  # (hidden_size, hidden_size)
-        R2 = householder_matrix(r2)  # (hidden_size, hidden_size)
+        R1 = householder_matrix(complex_unit_norm(r1))  # (hidden_size, hidden_size)
+        R2 = householder_matrix(complex_unit_norm(r2))  # (hidden_size, hidden_size)
         
         # Apply unitary transformation: D3 R2 F^(-1) D2 Π R1 F D1
         h = torch.fft.fft(d1.unsqueeze(0) * hx, dim=-1)  # (batch, hidden_size)
-        h = (R1 @ h.T).T  # (batch, hidden_size)
+        h = h @ R1  # (batch, hidden_size)
         h = torch.fft.ifft(d2.unsqueeze(0) * h[:, self.permutation], dim=-1)  # (batch, hidden_size)
-        h = d3.unsqueeze(0) * (R2 @ h.T).T  # (batch, hidden_size)
-        
+        h = d3.unsqueeze(0) * (h @ R2)  # (batch, hidden_size)
         # Add input embedding
-        h = h + torch.complex(self.input_embed(input), torch.zeros_like(self.input_embed(input)))
-        
-        h = self.activation(h)  # (batch, hidden_size)
+        h = h + self.input_embed(input.to(torch.complex64))
+        h = self.activation(h)
         
         return h, h

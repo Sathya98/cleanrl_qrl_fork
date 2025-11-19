@@ -13,13 +13,8 @@ import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
-from cleanrl_utils.atari_wrappers import (  # isort:skip
-    ClipRewardEnv,
-    EpisodicLifeEnv,
-    FireResetEnv,
-    MaxAndSkipEnv,
-    NoopResetEnv,
-)
+
+from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
 from cleanrl.urnn import URNN, LegacyURNN
 
 
@@ -45,14 +40,12 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "BreakoutNoFrameskip-v4"
+    env_id: str = "MiniGrid-MemoryS7-v0"
     """the id of the environment"""
-    total_timesteps: int = 10000000
+    total_timesteps: int = 15000000
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
-    min_learning_rate: float = 1e-7
-    """the minimum learning rate of the optimizer"""
     complex_learning_rate: float = 8e-5
     """the learning rate of the complex parameters"""
     legacy_urnn: bool = False
@@ -61,17 +54,17 @@ class Args:
     """whether to add input embed to hidden state URNN"""
     urnn_units: int = 128
     """the hidden size of the URNN"""
-    num_envs: int = 8
+    num_envs: int = 16
     """the number of parallel game environments"""
-    num_steps: int = 128
+    num_steps: int = 512
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
-    gamma: float = 0.99
+    gamma: float = 0.995
     """the discount factor gamma"""
     gae_lambda: float = 0.95
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 4
+    num_minibatches: int = 8
     """the number of mini-batches"""
     update_epochs: int = 4
     """the K epochs to update the policy"""
@@ -99,27 +92,27 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
-def make_env(env_id, idx, capture_video, video_folder_path, record_every=100):
+def make_env(env_id, idx, capture_video, video_folder_path,
+            record_every=1000, agent_view_size=3, tile_size=28,
+            max_episode_steps=96, frame_stack=1
+        ):
     def thunk():
+        env = gym.make(
+            env_id,
+            agent_view_size=agent_view_size,
+            tile_size=tile_size,
+            render_mode="rgb_array" if capture_video else None,
+        )
+        env = ImgObsWrapper(RGBImgPartialObsWrapper(env, tile_size=tile_size))
+        env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
         if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, video_folder_path,
                                            episode_trigger=lambda episode_id: (episode_id + 1) % record_every == 0
                                            )
-        else:
-            env = gym.make(env_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = NoopResetEnv(env, noop_max=30)
-        env = MaxAndSkipEnv(env, skip=4)
-        env = EpisodicLifeEnv(env)
-        if "FIRE" in env.unwrapped.get_action_meanings():
-            env = FireResetEnv(env)
-        env = ClipRewardEnv(env)
-        env = gym.wrappers.ResizeObservation(env, (84, 84))
-        env = gym.wrappers.GrayScaleObservation(env)
-        env = gym.wrappers.FrameStack(env, 1)
+        if frame_stack > 1:
+            env = gym.wrappers.FrameStack(env, frame_stack)
         return env
-
     return thunk
 
 
@@ -133,7 +126,7 @@ class Agent(nn.Module):
     def __init__(self, envs, urnn_units=128, legacy_urnn=False, urnn_id=False):
         super().__init__()
         self.network = nn.Sequential(
-            layer_init(nn.Conv2d(1, 32, 8, stride=4)),
+            layer_init(nn.Conv2d(3, 32, 8, stride=4)),
             nn.ReLU(),
             layer_init(nn.Conv2d(32, 64, 4, stride=2)),
             nn.ReLU(),
@@ -152,7 +145,7 @@ class Agent(nn.Module):
         self.critic = layer_init(nn.Linear(2 * urnn_units, 1), std=1)
 
     def get_states(self, x, urnn_state, done):
-        hidden = self.network(x / 255.0)
+        hidden = self.network(x.permute(0, 3, 1, 2) / 255.0)
 
         # URNN logic
         batch_size = urnn_state.shape[0]
@@ -198,8 +191,8 @@ if __name__ == "__main__":
     #naming section
     id = "id_" if args.urnn_input_dense else ""
     legacy = "leg" if args.legacy_urnn else ""
-    run_name = f"cleanrl_ppo_atari_{legacy}urnn{args.urnn_units}_{id}{args.env_id}_{args.seed}_{int(time.time())}"
-    run_dir = f"./runs/cleanrl_ppo_atari_{legacy}urnn{args.urnn_units}_{id}{ args.env_id}/s{args.seed}"
+    run_name = f"cleanrl_ppo_minigrid_{legacy}urnn{args.urnn_units}_{id}{args.env_id}_{args.seed}_{int(time.time())}"
+    run_dir = f"./runs/cleanrl_ppo_minigrid_{legacy}urnn{args.urnn_units}_{id}{ args.env_id}/s{args.seed}"
     os.makedirs(run_dir, exist_ok=True)
     video_folder_path = f"{run_dir}/videos"
     os.makedirs(video_folder_path, exist_ok=True)
@@ -274,9 +267,8 @@ if __name__ == "__main__":
         if args.anneal_lr:
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
             for group in optimizer.param_groups[:-1]:
-                group['lr'] = args.min_learning_rate + frac * (args.learning_rate - args.min_learning_rate)
-            optimizer.param_groups[-1]['lr'] = args.min_learning_rate + \
-                frac * (args.complex_learning_rate - args.min_learning_rate)
+                group['lr'] = frac * args.learning_rate
+            optimizer.param_groups[-1]['lr'] = frac * args.complex_learning_rate
         
         for step in range(0, args.num_steps):
             global_step += args.num_envs

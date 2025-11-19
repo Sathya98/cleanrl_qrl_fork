@@ -43,7 +43,7 @@ class Args:
     """total timesteps of the experiments"""
     learning_rate: float = 2.75e-4
     """the learning rate of the optimizer"""
-    min_learning_rate: float = 0.0
+    min_learning_rate: float = 1e-5
     """the minimum learning rate (used when annealing)"""
     num_envs: int = 32
     """the number of parallel game environments"""
@@ -59,7 +59,7 @@ class Args:
     """the number of mini-batches"""
     update_epochs: int = 3
     """the K epochs to update the policy"""
-    norm_adv: bool = True
+    norm_adv: bool = False
     """Toggles advantages normalization"""
     clip_coef: float = 0.1
     """the surrogate clipping coefficient"""

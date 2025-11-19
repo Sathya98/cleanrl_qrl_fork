@@ -3,11 +3,11 @@ import numpy as np
 from urnn import URNN, LegacyURNN, householder_matrix
 
 # Test parameters
-input_dim = 32
-hidden_dim = 32
-sequence_length = 16
-batch_size = 4
-torch.manual_seed(42)
+input_dim = 8
+hidden_dim = 8
+sequence_length = 32
+batch_size = 1
+torch.manual_seed(24)
 
 def test_householder_matrix():
     """Test that householder_matrix produces unitary matrices."""
@@ -17,15 +17,15 @@ def test_householder_matrix():
     
     hidden_size = hidden_dim
     # Create a random complex vector and normalize it
-    v = torch.randn((1, hidden_size), dtype=torch.complex64)
-    v = v / torch.linalg.norm(v)  # Normalize
+    v = torch.randn((batch_size, hidden_size), dtype=torch.complex64)
+    v = v / torch.linalg.norm(v, dim=-1).unsqueeze(-1)  # Normalize
     
     # Build Householder matrix
-    H = householder_matrix(v)  # (1, hidden_size, hidden_size)
+    H = householder_matrix(v)  # (batch_size, hidden_size, hidden_size)
     
     # Verify unitarity: H @ H.conj().T should be close to I
-    I_expected = torch.eye(hidden_size, dtype=torch.complex64).unsqueeze(0)  # (1, hidden_size, hidden_size)
-    H_H_dag = torch.bmm(H, H.conj().transpose(-2, -1))  # (1, hidden_size, hidden_size)
+    I_expected = torch.tile(torch.eye(hidden_size, dtype=torch.complex64), (batch_size, 1, 1))  # (batch_size, hidden_size, hidden_size)
+    H_H_dag = torch.bmm(H, H.conj().transpose(-2, -1))  # (batch_size, hidden_size, hidden_size)
     
     error = torch.abs(H_H_dag - I_expected).max().item()  # scalar
     print(f"Householder matrix shape: {H.shape}")
@@ -38,7 +38,7 @@ def test_householder_matrix():
     
     # Also check determinant (should be -1 for reflection)
     det = torch.linalg.det(H)
-    print(f"Determinant: {det.item()} (expected: -1.0 for reflection)")
+    print(f"Determinant: {det} (expected: -1.0 for reflection)")
     
     print()
 
@@ -50,17 +50,17 @@ def test_urnn():
     print("=" * 60)
     
     # Initialize URNN
-    urnn = URNN(input_dim, hidden_dim)
+    urnn = URNN(input_dim, hidden_dim, add_input_dense=True)
     print(f"URNN initialized: input_size={input_dim}, hidden_size={hidden_dim}")
     
     # Create random input sequence
     inputs = torch.randn(sequence_length, batch_size, input_dim)
-    print(f"Input sequence shape: {inputs.shape}")
+    print(f"Input sequence shape: {inputs.shape} mean: {inputs.mean().item()}, std: {inputs.std().item()}")
     
     # Initialize hidden state
     hx = urnn.initial_hidden(batch_size)
     print(f"Initial hidden state shape: {hx.shape}")
-    print(f"Initial hidden state norm: {torch.abs(hx).mean().item():.6f}")
+    print(f"Initial hidden state norm: {torch.linalg.norm(hx, dim=-1).mean().item()}")
     
     # Process sequence
     outputs = []
@@ -74,11 +74,10 @@ def test_urnn():
         outputs.append(output)
         
         # Track norms
-        norm = torch.linalg.norm(output).item()
+        norm = torch.linalg.norm(output, dim=-1).mean().item()
         norms.append(norm)
         
-        if t < 3 or t >= sequence_length - 3:
-            print(f"  Step {t:2d}: output norm = {norm:.6f}, hidden norm = {torch.abs(h).mean().item():.6f}")
+        print(f"  Step {t:2d}: output norm = {norm:.6f}")
     
     outputs = torch.stack(outputs, dim=0)  # (seq_len, batch, hidden_dim)
     
@@ -106,17 +105,17 @@ def test_legacy_urnn():
     print("=" * 60)
     
     # Initialize LegacyURNN
-    legacy_urnn = LegacyURNN(input_dim, hidden_dim)
+    legacy_urnn = LegacyURNN(input_dim, hidden_dim, norm_scale=np.sqrt(hidden_dim))
     print(f"LegacyURNN initialized: input_size={input_dim}, hidden_size={hidden_dim}")
     
     # Create random input sequence
-    inputs = torch.randn(sequence_length, batch_size, input_dim)
-    print(f"Input sequence shape: {inputs.shape}")
+    inputs = torch.randn(sequence_length, batch_size, input_dim, dtype=torch.float32)
+    print(f"Input sequence shape: {inputs.shape} mean: {inputs.mean().item()}, std: {inputs.std().item()}")
     
     # Initialize hidden state
     hx = legacy_urnn.initial_hidden(batch_size)
     print(f"Initial hidden state shape: {hx.shape}")
-    print(f"Initial hidden state norm: {torch.abs(hx).mean().item():.6f}")
+    print(f"Initial hidden state norm: {torch.linalg.norm(hx, dim=-1).mean().item():.6f}")
     
     # Process sequence
     outputs = []
@@ -130,11 +129,10 @@ def test_legacy_urnn():
         outputs.append(output)
         
         # Track norms
-        norm = torch.abs(output).mean().item()
+        norm = torch.linalg.norm(output, dim=-1).mean().item()
         norms.append(norm)
         
-        if t < 3 or t >= sequence_length - 3:
-            print(f"  Step {t:2d}: output norm = {norm:.6f}, hidden norm = {torch.abs(h).mean().item():.6f}")
+        print(f"  Step {t:2d}: output norm = {norm:.6f}")
     
     outputs = torch.stack(outputs, dim=0)  # (seq_len, batch, hidden_dim)
     

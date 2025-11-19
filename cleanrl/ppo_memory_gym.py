@@ -19,13 +19,13 @@ import memory_gym
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-    seed: int = 0
+    seed: int = 6
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    cuda_device: int = 4
+    cuda_device: int = 6
     """the device to use for training"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
@@ -43,7 +43,7 @@ class Args:
     """total timesteps of the experiments"""
     learning_rate: float = 2.75e-4
     """the learning rate of the optimizer"""
-    min_learning_rate: float = 0.0
+    min_learning_rate: float = 1e-5
     """the minimum learning rate (used when annealing)"""
     num_envs: int = 32
     """the number of parallel game environments"""
@@ -95,8 +95,10 @@ def make_env(env_id, idx, capture_video, video_folder_path,
                                            episode_trigger=lambda episode_id: (episode_id + 1) % record_every == 0
                                            )
         env = gym.wrappers.RecordEpisodeStatistics(env)
+        print(f"Observation space: {env.observation_space}")
         if frame_stack > 1:
             env = gym.wrappers.FrameStack(env, frame_stack)
+        print(f"Observation space after frame stack: {env.observation_space}")
         return env
     return thunk
 
